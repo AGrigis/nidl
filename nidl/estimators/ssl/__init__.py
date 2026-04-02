@@ -6,7 +6,9 @@
 # for details.
 ##########################################################################
 
-""" Self-supervised estimators.
-"""
+"""Self-supervised estimators."""
 
+from .barlowtwins import BarlowTwins
+from .dino import DINO
 from .simclr import SimCLR
+from .yaware import YAwareContrastiveLearning
