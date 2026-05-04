@@ -19,18 +19,21 @@ from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 
 from nidl.estimators.base import BaseEstimator
+from nidl.utils.data_parsing import inspect_batch
 from nidl.utils.validation import _estimator_is
 
 
-class ModelProbing(pl.Callback):
-    """Callback to probe the representation of an embedding estimator on a
-    dataset.
+class ModelProbingCallback(pl.Callback):
+    """Callback to probe the representation of
+    :class:`~nidl.estimators.base.BaseEstimator` on a dataset.
 
     It has the following logic:
 
     1) Embeds the input data (training+test) through the estimator using
-       `transform_step` method (handles distributed multi-gpu forward pass).
-    2) Train the probe on the training embedding (handles multi-cpu training).
+       ``transform_step_with_targets`` method (handles distributed multi-gpu
+       forward pass).
+    2) Train a scikit-learn probe on the training embedding (handles multi-cpu
+       training).
     3) Evaluate the probe on the test embedding and log the scores.
 
     The probing can be performed at the end of training epochs, validation
@@ -106,8 +109,8 @@ class ModelProbing(pl.Callback):
     Examples
     --------
     >>> from sklearn.linear_model import LogisticRegression
-    >>> from nidl.callbacks import ModelProbing
-    >>> callback = ModelProbing(
+    >>> from nidl.callbacks import ModelProbingCallback
+    >>> callback = ModelProbingCallback(
     ...     train_dataloader=train_loader,
     ...     test_dataloader=test_loader,
     ...     probe=LogisticRegression(),
@@ -143,10 +146,6 @@ class ModelProbing(pl.Callback):
         self.counter_val_epochs = 0
 
         self.scorers = check_scoring(self.probe, scoring=self.scoring)
-
-    def fit(self, X, y):
-        """Fit the probe on the training data embeddings."""
-        return self.probe.fit(X, y)
 
     def log_metrics(self, pl_module, scores):
         """Log the metrics given the predictions and the true labels."""
@@ -219,8 +218,8 @@ class ModelProbing(pl.Callback):
         Parameters
         ----------
         pl_module: BaseEstimator
-            The BaseEstimator module that implements the `transform_step`.
-
+            The :class:`~nidl.estimators.base.BaseEstimator` module that
+            implements ``transform_step_with_targets``.
         Raises
         ------
         ValueError: If the pl_module does not inherit from `BaseEstimator` or
@@ -244,20 +243,29 @@ class ModelProbing(pl.Callback):
         )
 
         # Check arrays
-        X_train, y_train = (
-            check_array(X_train),
-            check_array(y_train, ensure_2d=False),  # can be 1d
-        )
-        X_test, y_test = (
-            check_array(X_test),
-            check_array(y_test, ensure_2d=False),  # can be 1d
-        )
+        try:
+            X_train, y_train = (
+                check_array(X_train),
+                check_array(y_train, ensure_2d=False),  # can be 1d
+            )
+            X_test, y_test = (
+                check_array(X_test),
+                check_array(y_test, ensure_2d=False),  # can be 1d
+            )
+        except ValueError as e:
+            raise ValueError(
+                "The extracted features and labels should be array-like, got "
+                f"{inspect_batch(X_train, name='X_train')} and "
+                f"{inspect_batch(y_train, name='y_train')} for training, and "
+                f"{inspect_batch(X_test, name='X_test')} and "
+                f"{inspect_batch(y_test, name='y_test')} for test."
+            ) from e
 
         # For efficiency, fit/score on rank 0 only
         scores = None
         if trainer.is_global_zero:
             # Fit the probe
-            self.fit(X_train, y_train)
+            self.probe.fit(X_train, y_train)
             # Compute scores
             scores = self.scorers(self.probe, X_test, y_test)
 
@@ -271,17 +279,16 @@ class ModelProbing(pl.Callback):
     def extract_features(self, trainer, pl_module, dataloader):
         """Extract features from a dataloader with the BaseEstimator.
 
-        By default, it uses the `transform_step` logic applied on each batch to
-        get the embeddings with the labels.
-        The input dataloader should yield batches of the form `(X, y)` where X
-        is the input data and y is the label.
+        It uses the `transform_step_with_targets` logic applied on each
+        batch to get the embeddings with the labels.
 
         Parameters
         ----------
         trainer: pl.Trainer
             The pytorch-lightning trainer instance.
         pl_module: BaseEstimator
-            The BaseEstimator module that implements the 'transform_step'.
+            The :class:`~nidl.estimators.base.BaseEstimator` module that
+            implements ``transform_step_with_targets``.
         dataloader: torch.utils.data.DataLoader
             The dataloader to extract features from. It should yield batches of
             the form `(X, y)` where `X` is the input data and `y` is the label.
@@ -304,17 +311,18 @@ class ModelProbing(pl.Callback):
             for batch_idx, batch in tqdm(
                 enumerate(dataloader),
                 desc="Extracting features",
-                disable=(not trainer.is_global_zero),
+                disable=(not self.prog_bar or not trainer.is_global_zero),
                 leave=False,
             ):
-                x_batch, y_batch = batch
-                x_batch = x_batch.to(pl_module.device)
-                y_batch = y_batch.to(pl_module.device)
-                features = pl_module.transform_step(
-                    x_batch, batch_idx=batch_idx
+                # Move batch the same way Lightning would
+                batch = trainer.strategy.batch_to_device(
+                    batch, pl_module.device, dataloader_idx=0
                 )
-                X.append(features.detach())
-                y.append(y_batch.detach())
+                out = pl_module.transform_step_with_targets(
+                    batch, batch_idx=batch_idx
+                )
+                X.append(out["features"].detach())
+                y.append(out["targets"].detach())
 
         # Concatenate the embeddings
         X = torch.cat(X)

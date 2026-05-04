@@ -9,6 +9,7 @@
 """
 Various utilities to download model weights.
 """
+
 from __future__ import annotations
 
 import urllib.parse as urlparse
@@ -17,9 +18,8 @@ import warnings
 from pathlib import Path
 from typing import Any, Optional, Union
 
+import pytorch_lightning as pl
 import torch
-
-from ..estimators.base import BaseEstimator
 
 
 class Weights:
@@ -32,7 +32,7 @@ class Weights:
         the location of the model weights specified in the form
         `hf-hub:path/architecture_name@revision` if available in Hugging Face
         hub or `ns-hub:path/architecture_name` if available in the NeuroSpin
-        hub or a path if avaiable in your local machine.
+        hub or a path if available in your local machine.
     data_dir: pathlib.Path or str
         path where data should be downloaded.
     filepath: str
@@ -49,7 +49,7 @@ class Weights:
         self.filepath = filepath
         self.dtype = name.split(":")[0] if ":" in name else "local"
         # Whether the file is a lightning checkpoint file
-        self.is_lightning_ckpt = filepath.endswith('.ckpt')
+        self.is_lightning_ckpt = filepath.endswith(".ckpt")
         if self.dtype == "hf-hub":
             hf_id, hf_revision = self.hub_split(name)
             self.weight_file = self.hf_download(
@@ -64,64 +64,90 @@ class Weights:
             f"Invalid weights '{self.weight_file}'"
         )
 
-    def load_checkpoint(self,
-                        model: BaseEstimator,
-                        #device: _DEVICE = 'cpu',
-                        **kwargs: Any,
-                        ):
+    def load_checkpoint(
+        self,
+        model: pl.LightningModule,
+        *,
+        map_location: Union[str, dict, torch.device] = "cpu",
+        **kwargs: Any,
+    ):
         """Load the checkpoint.
 
         Parameters
         ----------
         model: LightningModule
             an pytorch_lightning's module class.
-        device: torch.device or str
-            the device on which to load the model and to use for inference.
-            Default to cpu. Only single device is supported for now.
-        **kwargs: Any extra keyword args needed to init the model. Can also be
+        map_location : Union[str, dict,  torch.device]
+            Device mapping used when loading the checkpoint.
+        **kwargs: Any
+            Any extra keyword args needed to init the model. Can also be
             used to override saved hyperparameter values, in particular to
             override trainer parameters such as `accelerator` or `devices`.
+
+        Returns
+        -------
+        pl.LightningModule or None
+            The instantiated LightningModule loaded from the checkpoint.
+            Returns None if the provided file is not recognized as a Lightning
+            checkpoint.
+
         """
         if not self.is_lightning_ckpt:
-            warnings.warn((
-                f"The provided file ({self.weight_file}) does not seem to be "
-                "a Lightning's checkpoint file. To load weights directly, use "
-                "`load_pretrained` instead."),
-                stacklevel=2)
+            warnings.warn(
+                (
+                    f"The provided file ({self.weight_file}) does not seem to "
+                    "be a Lightning's checkpoint file. To load weights "
+                    "directly, use `load_pretrained` instead."
+                ),
+                stacklevel=2,
+            )
             return
         # If `devices` and `accelerator` not in kwargs, add default values.
         # This is necessary to override the device and accelerator saved in the
         # checkpoint and ensure that the trainer within the estimator
-        # will be instantiated with values compatible with the user"s setup.
+        # will be instantiated with values compatible with the user's setup.
         params_init = dict(
             kwargs,
-            **({"devices": 'auto'} if 'devices' not in kwargs else {}),
-            **({"accelerator": 'auto'} if 'accelerator' not in kwargs else {}),
+            **({"devices": "auto"} if "devices" not in kwargs else {}),
+            **({"accelerator": "auto"} if "accelerator" not in kwargs else {}),
         )
         return model.load_from_checkpoint(
             checkpoint_path=self.weight_file,
-            map_location='cpu',
-            **params_init)
+            map_location=map_location,
+            **params_init,
+        )
 
-
-    def load_pretrained(self, model: torch.nn.Module):
+    def load_pretrained(
+        self, model: torch.nn.Module, weights_only: bool = True
+    ):
         """Load the model weights.
 
         Parameters
         ----------
         model: torch.nn.Module
             an input model with a `load_pretrained` method decalred.
+        weights_only: bool, default=False
+            Indicates whether unpickler should be restricted to
+            loading only tensors, primitive types, dictionaries
+            and any types added via
+            :func:`torch.serialization.add_safe_globals`.
+
         """
         if self.weight_file is None:
             warnings.warn("Define weight file location first!", stacklevel=2)
             return
         if self.is_lightning_ckpt:
-            warnings.warn((
-                "For pytorch_lightning checkpoints, use the method "
-                "`load_checkpoint` instead."),
-                stacklevel=2)
+            warnings.warn(
+                (
+                    "For pytorch_lightning checkpoints, use the method "
+                    "`load_checkpoint` instead."
+                ),
+                stacklevel=2,
+            )
             return
-        model.load_state_dict(torch.load(self.weight_file, weights_only=True))
+        model.load_state_dict(
+            torch.load(self.weight_file, weights_only=weights_only)
+        )
 
     @classmethod
     def hub_split(cls, hub_name: str) -> tuple[str, Optional[str]]:
